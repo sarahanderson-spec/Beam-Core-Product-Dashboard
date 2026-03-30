@@ -54,7 +54,7 @@ body{font-family:var(--font);background:var(--bg);color:var(--text);font-size:13
 .field-input[readonly]{color:var(--muted);}
 .connect-btn{width:100%;padding:10px;background:var(--navy);color:white;border:none;border-radius:var(--r);font-size:13px;font-weight:500;font-family:var(--font);cursor:pointer;margin-top:8px;transition:background 0.15s;}
 .connect-btn:hover{background:var(--dblue);}
-.connect-err{font-size:12px;color:var(--red);margin-top:10px;display:none;}
+.connect-err{font-size:12px;color:var(--red);margin-top:10px;display:none;line-height:1.6;}
 .connect-note{font-size:11px;color:var(--muted);margin-top:14px;line-height:1.6;padding:10px 12px;background:var(--lgray);border-radius:var(--r);}
 
 /* ── LAYOUT ── */
@@ -473,12 +473,17 @@ function jqlEncode(q){ return encodeURIComponent(q); }
 async function jiraFetch(jql, fields, maxResults=200){
   const url = `https://${DOMAIN}/rest/api/3/search?jql=${jqlEncode(jql)}&fields=${fields}&maxResults=${maxResults}&excludeArchivedIssues=true`;
   const res = await fetch(url, {
+    method: 'GET',
     headers: {
       'Authorization': `Basic ${AUTH}`,
-      'Accept': 'application/json'
+      'Accept': 'application/json',
+      'Content-Type': 'application/json'
     }
   });
-  if(!res.ok) throw new Error(`${res.status}: ${res.statusText}`);
+  if(!res.ok){
+    const text = await res.text().catch(()=>'');
+    throw new Error(`${res.status} ${res.statusText}${text ? ': '+text.substring(0,200) : ''}`);
+  }
   return res.json();
 }
 
@@ -735,25 +740,77 @@ function exportCSV(tableId, filename){
   a.click();
 }
 
+function toBase64(str){
+  // Unicode-safe base64 encoding — handles special chars in tokens
+  return btoa(encodeURIComponent(str).replace(/%([0-9A-F]{2})/g,
+    (_,p1) => String.fromCharCode('0x'+p1)));
+}
+
 async function connect(){
   const token = document.getElementById('tokenInput').value.trim();
   const email = document.getElementById('emailInput').value.trim();
   const errEl = document.getElementById('connectErr');
   errEl.style.display = 'none';
   if(!token){ errEl.textContent = 'Please enter your API token.'; errEl.style.display='block'; return; }
-  AUTH = btoa(`${email}:${token}`);
+  if(!email){ errEl.textContent = 'Please enter your email.'; errEl.style.display='block'; return; }
+
+  // Use standard btoa with the raw credentials — Jira tokens are ASCII safe
+  try {
+    AUTH = btoa(`${email}:${token}`);
+  } catch(e) {
+    AUTH = toBase64(`${email}:${token}`);
+  }
+
   try{
-    const test = await jiraFetch(`project = "BCD" ORDER BY created DESC`, 'summary', 1);
-    if(test.issues !== undefined){
-      document.getElementById('connectOverlay').classList.add('hidden');
-      document.getElementById('connDot').classList.add('connected');
-      document.getElementById('connLabel').textContent = 'Connected';
-      document.getElementById('refreshBtn').style.display = 'flex';
-      await refreshAll();
+    const url = `https://beamdental.atlassian.net/rest/api/3/myself`;
+    const res = await fetch(url, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Basic ${AUTH}`,
+        'Accept': 'application/json',
+        'Content-Type': 'application/json'
+      }
+    });
+
+    if(res.status === 401){
+      AUTH = '';
+      errEl.textContent = 'Authentication failed (401). Double-check your email and API token are correct and the token has not expired.';
+      errEl.style.display = 'block';
+      return;
     }
+    if(res.status === 403){
+      AUTH = '';
+      errEl.textContent = 'Permission denied (403). Your account may not have access to this Jira instance.';
+      errEl.style.display = 'block';
+      return;
+    }
+    if(!res.ok){
+      AUTH = '';
+      errEl.textContent = `Jira returned error ${res.status}: ${res.statusText}. Check your domain and token.`;
+      errEl.style.display = 'block';
+      return;
+    }
+
+    const me = await res.json();
+    document.getElementById('connectOverlay').classList.add('hidden');
+    document.getElementById('connDot').classList.add('connected');
+    document.getElementById('connLabel').textContent = `Connected as ${me.displayName || email}`;
+    document.getElementById('refreshBtn').style.display = 'flex';
+    await refreshAll();
+
   } catch(e){
     AUTH = '';
-    errEl.textContent = `Connection failed: ${e.message}. Check your token and email.`;
+    // Distinguish network errors from CORS from other issues
+    if(e.message && e.message.includes('fetch')){
+      errEl.innerHTML = `Network error — cannot reach beamdental.atlassian.net.<br><br>
+        <strong>Most likely causes:</strong><br>
+        1. Your company network or VPN is blocking the request<br>
+        2. Try opening this dashboard on your personal wifi or mobile hotspot to test<br>
+        3. If that works, ask IT to allowlist beamdental.atlassian.net API calls from this domain<br><br>
+        <small>Technical detail: ${e.message}</small>`;
+    } else {
+      errEl.textContent = `Error: ${e.message}`;
+    }
     errEl.style.display = 'block';
   }
 }
